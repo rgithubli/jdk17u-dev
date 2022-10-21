@@ -60,7 +60,7 @@ public class LambdaContainsOldInf extends DynamicArchiveTestBase {
             use_whitebox_jar,
             "-cp", appJar, mainClass)
             .assertNormalExit(output -> {
-                output
+                output.shouldContain("Skipping OldProvider: Old class has been linked")
                       .shouldMatch("Skipping.LambdaContainsOldInfApp[$][$]Lambda[$].*0x.*:.*Old.class.has.been.linked")
                       .shouldHaveExitValue(0);
             });
