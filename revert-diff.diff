@@ -1,0 +1,327 @@
+diff --git a/src/hotspot/share/cds/dynamicArchive.cpp b/src/hotspot/share/cds/dynamicArchive.cpp
+index 9fdb2a796b4..13c2af90f8c 100644
+--- a/src/hotspot/share/cds/dynamicArchive.cpp
++++ b/src/hotspot/share/cds/dynamicArchive.cpp
+@@ -111,7 +111,6 @@ public:
+     // Block concurrent class unloading from changing the _dumptime_table
+     MutexLocker ml(DumpTimeTable_lock, Mutex::_no_safepoint_check_flag);
+     SystemDictionaryShared::check_excluded_classes();
+-    SystemDictionaryShared::cleanup_lambda_proxy_class_dictionary();
+ 
+     init_header();
+     gather_source_objs();
+diff --git a/src/hotspot/share/cds/metaspaceShared.cpp b/src/hotspot/share/cds/metaspaceShared.cpp
+index db387f8eaca..eff3ce860a6 100644
+--- a/src/hotspot/share/cds/metaspaceShared.cpp
++++ b/src/hotspot/share/cds/metaspaceShared.cpp
+@@ -488,7 +488,6 @@ void VM_PopulateDumpSharedSpace::doit() {
+   // Block concurrent class unloading from changing the _dumptime_table
+   MutexLocker ml(DumpTimeTable_lock, Mutex::_no_safepoint_check_flag);
+   SystemDictionaryShared::check_excluded_classes();
+-  SystemDictionaryShared::cleanup_lambda_proxy_class_dictionary();
+ 
+   StaticArchiveBuilder builder;
+   builder.gather_source_objs();
+diff --git a/src/hotspot/share/classfile/systemDictionaryShared.cpp b/src/hotspot/share/classfile/systemDictionaryShared.cpp
+index 00cfd9f83af..9a2b15512b0 100644
+--- a/src/hotspot/share/classfile/systemDictionaryShared.cpp
++++ b/src/hotspot/share/classfile/systemDictionaryShared.cpp
+@@ -1537,28 +1537,6 @@ bool SystemDictionaryShared::is_dumptime_table_empty() {
+   return false;
+ }
+ 
+-class CleanupDumpTimeLambdaProxyClassTable: StackObj {
+- public:
+-  bool do_entry(LambdaProxyClassKey& key, DumpTimeLambdaProxyClassInfo& info) {
+-    assert_lock_strong(DumpTimeTable_lock);
+-    for (int i = 0; i < info._proxy_klasses->length(); i++) {
+-      InstanceKlass* ik = info._proxy_klasses->at(i);
+-      if (!ik->can_be_verified_at_dumptime()) {
+-        info._proxy_klasses->remove_at(i);
+-      }
+-    }
+-    return info._proxy_klasses->length() == 0 ? true /* delete the node*/ : false;
+-  }
+-};
+-
+-void SystemDictionaryShared::cleanup_lambda_proxy_class_dictionary() {
+-  assert_lock_strong(DumpTimeTable_lock);
+-  if (_dumptime_lambda_proxy_class_dictionary != NULL) {
+-    CleanupDumpTimeLambdaProxyClassTable cleanup_proxy_classes;
+-    _dumptime_lambda_proxy_class_dictionary->unlink(&cleanup_proxy_classes);
+-  }
+-}
+-
+ #if INCLUDE_CDS_JAVA_HEAP
+ 
+ class ArchivedMirrorPatcher {
+diff --git a/src/hotspot/share/classfile/systemDictionaryShared.hpp b/src/hotspot/share/classfile/systemDictionaryShared.hpp
+index cb20ac1969d..70802bb659e 100644
+--- a/src/hotspot/share/classfile/systemDictionaryShared.hpp
++++ b/src/hotspot/share/classfile/systemDictionaryShared.hpp
+@@ -278,7 +278,6 @@ public:
+   static size_t estimate_size_for_archive();
+   static void write_to_archive(bool is_static_archive = true);
+   static void adjust_lambda_proxy_class_dictionary();
+-  static void cleanup_lambda_proxy_class_dictionary();
+   static void serialize_dictionary_headers(class SerializeClosure* soc,
+                                            bool is_static_archive = true);
+   static void serialize_vm_classes(class SerializeClosure* soc);
+diff --git a/test/hotspot/jtreg/TEST.groups b/test/hotspot/jtreg/TEST.groups
+index 74fb2266c70..2c1e683b858 100644
+--- a/test/hotspot/jtreg/TEST.groups
++++ b/test/hotspot/jtreg/TEST.groups
+@@ -405,7 +405,6 @@ hotspot_appcds_dynamic = \
+  -runtime/cds/appcds/DumpClassList.java \
+  -runtime/cds/appcds/DumpClassListWithLF.java \
+  -runtime/cds/appcds/ExtraSymbols.java \
+- -runtime/cds/appcds/LambdaContainsOldInf.java \
+  -runtime/cds/appcds/LambdaEagerInit.java \
+  -runtime/cds/appcds/LambdaProxyClasslist.java \
+  -runtime/cds/appcds/LambdaVerificationFailedDuringDump.java \
+diff --git a/test/hotspot/jtreg/runtime/cds/appcds/LambdaContainsOldInf.java b/test/hotspot/jtreg/runtime/cds/appcds/LambdaContainsOldInf.java
+deleted file mode 100644
+index a2c85542244..00000000000
+--- a/test/hotspot/jtreg/runtime/cds/appcds/LambdaContainsOldInf.java
++++ /dev/null
+@@ -1,78 +0,0 @@
+-/*
+- * Copyright (c) 2021, Oracle and/or its affiliates. All rights reserved.
+- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+- *
+- * This code is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 only, as
+- * published by the Free Software Foundation.
+- *
+- * This code is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- * version 2 for more details (a copy is included in the LICENSE file that
+- * accompanied this code).
+- *
+- * You should have received a copy of the GNU General Public License version
+- * 2 along with this work; if not, write to the Free Software Foundation,
+- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+- *
+- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+- * or visit www.oracle.com if you need additional information or have any
+- * questions.
+- *
+- */
+-
+-/*
+- * @test
+- * @bug 8274944
+- * @summary VM should not crash during CDS dump when a lambda proxy class
+- *          contains an old version of interface.
+- * @requires vm.cds
+- * @library /test/lib
+- * @compile test-classes/OldProvider.jasm
+- * @compile test-classes/LambdaContainsOldInfApp.java
+- * @run driver LambdaContainsOldInf
+- */
+-
+-import jdk.test.lib.cds.CDSOptions;
+-import jdk.test.lib.cds.CDSTestUtils;
+-import jdk.test.lib.process.OutputAnalyzer;
+-
+-public class LambdaContainsOldInf {
+-
+-    public static void main(String[] args) throws Exception {
+-        String mainClass = "LambdaContainsOldInfApp";
+-        String namePrefix = "lambdacontainsoldinf";
+-        JarBuilder.build(namePrefix, mainClass, "OldProvider");
+-
+-        String appJar = TestCommon.getTestJar(namePrefix + ".jar");
+-        String classList = namePrefix + ".list";
+-        String archiveName = namePrefix + ".jsa";
+-
+-        // dump class list
+-        CDSTestUtils.dumpClassList(classList, "-cp", appJar, mainClass);
+-
+-        // create archive with the class list
+-        CDSOptions opts = (new CDSOptions())
+-            .addPrefix("-XX:ExtraSharedClassListFile=" + classList,
+-                       "-cp", appJar,
+-                       "-Xlog:class+load,cds")
+-            .setArchiveName(archiveName);
+-        OutputAnalyzer output = CDSTestUtils.createArchiveAndCheck(opts);
+-        TestCommon.checkExecReturn(output, 0, true,
+-                                   "Skipping OldProvider: Old class has been linked");
+-        output.shouldMatch("Skipping.LambdaContainsOldInfApp[$][$]Lambda[$].*0x.*:.*Old.class.has.been.linked");
+-
+-        // run with archive
+-        CDSOptions runOpts = (new CDSOptions())
+-            .addPrefix("-cp", appJar, "-Xlog:class+load,cds=debug")
+-            .setArchiveName(archiveName)
+-            .setUseVersion(false)
+-            .addSuffix(mainClass);
+-        output = CDSTestUtils.runWithArchive(runOpts);
+-        TestCommon.checkExecReturn(output, 0, true,
+-            "[class,load] LambdaContainsOldInfApp source: shared objects file");
+-        output.shouldMatch(".class.load. OldProvider.source:.*lambdacontainsoldinf.jar")
+-              .shouldMatch(".class.load. LambdaContainsOldInfApp[$][$]Lambda[$].*/0x.*source:.*LambdaContainsOldInf");
+-    }
+-}
+diff --git a/test/hotspot/jtreg/runtime/cds/appcds/dynamicArchive/LambdaContainsOldInf.java b/test/hotspot/jtreg/runtime/cds/appcds/dynamicArchive/LambdaContainsOldInf.java
+deleted file mode 100644
+index 933d71e9cc1..00000000000
+--- a/test/hotspot/jtreg/runtime/cds/appcds/dynamicArchive/LambdaContainsOldInf.java
++++ /dev/null
+@@ -1,81 +0,0 @@
+-/*
+- * Copyright (c) 2021, Oracle and/or its affiliates. All rights reserved.
+- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+- *
+- * This code is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 only, as
+- * published by the Free Software Foundation.
+- *
+- * This code is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- * version 2 for more details (a copy is included in the LICENSE file that
+- * accompanied this code).
+- *
+- * You should have received a copy of the GNU General Public License version
+- * 2 along with this work; if not, write to the Free Software Foundation,
+- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+- *
+- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+- * or visit www.oracle.com if you need additional information or have any
+- * questions.
+- *
+- */
+-
+-/*
+- * @test
+- * @bug 8274944
+- * @summary VM should not crash during CDS dump when a lambda proxy class
+- *          contains an old version of interface.
+- * @requires vm.cds
+- * @library /test/lib /test/hotspot/jtreg/runtime/cds/appcds
+- *          /test/hotspot/jtreg/runtime/cds/appcds/test-classes
+- *          /test/hotspot/jtreg/runtime/cds/appcds/dynamicArchive/test-classes
+- * @build LambdaContainsOldInfApp sun.hotspot.WhiteBox OldProvider LambdaVerification
+- * @run driver jdk.test.lib.helpers.ClassFileInstaller -jar lambda_contains_old_inf.jar LambdaVerification
+- *             LambdaContainsOldInfApp OldProvider
+- * @run driver jdk.test.lib.helpers.ClassFileInstaller -jar WhiteBox.jar sun.hotspot.WhiteBox
+- * @run driver jdk.test.lib.helpers.ClassFileInstaller sun.hotspot.WhiteBox
+- * @run main/othervm -XX:+UnlockDiagnosticVMOptions -XX:+WhiteBoxAPI -Xbootclasspath/a:. LambdaContainsOldInf
+- */
+-
+-import jdk.test.lib.helpers.ClassFileInstaller;
+-
+-public class LambdaContainsOldInf extends DynamicArchiveTestBase {
+-    public static void main(String[] args) throws Exception {
+-        runTest(LambdaContainsOldInf::test);
+-    }
+-
+-    static void test() throws Exception {
+-        String topArchiveName = getNewArchiveName();
+-        String appJar = ClassFileInstaller.getJarPath("lambda_contains_old_inf.jar");
+-        String mainClass = "LambdaContainsOldInfApp";
+-        String wbJar = ClassFileInstaller.getJarPath("WhiteBox.jar");
+-        String use_whitebox_jar = "-Xbootclasspath/a:" + wbJar;
+-
+-        dump(topArchiveName,
+-            "-XX:+UnlockDiagnosticVMOptions",
+-            "-XX:+WhiteBoxAPI",
+-            "-Xlog:class+load=debug,cds=debug,cds+dynamic=info",
+-            use_whitebox_jar,
+-            "-cp", appJar, mainClass)
+-            .assertNormalExit(output -> {
+-                output
+-                      .shouldMatch("Skipping.LambdaContainsOldInfApp[$][$]Lambda[$].*0x.*:.*Old.class.has.been.linked")
+-                      .shouldHaveExitValue(0);
+-            });
+-
+-        run(topArchiveName,
+-            "-XX:+UnlockDiagnosticVMOptions",
+-            "-XX:+WhiteBoxAPI",
+-            use_whitebox_jar,
+-            "-Xlog:class+load=debug",
+-            "-cp", appJar, mainClass)
+-            .assertNormalExit(output -> {
+-                output.shouldContain("[class,load] LambdaContainsOldInfApp source: shared objects file (top)")
+-                      .shouldMatch(".class.load. OldProvider.source:.*lambda_contains_old_inf.jar")
+-                      .shouldMatch(".class.load. LambdaContainsOldInfApp[$][$]Lambda[$].*/0x.*source:.*LambdaContainsOldInf")
+-                      .shouldHaveExitValue(0);
+-            });
+-    }
+-}
+diff --git a/test/hotspot/jtreg/runtime/cds/appcds/test-classes/LambdaContainsOldInfApp.java b/test/hotspot/jtreg/runtime/cds/appcds/test-classes/LambdaContainsOldInfApp.java
+deleted file mode 100644
+index 81b9cdba49b..00000000000
+--- a/test/hotspot/jtreg/runtime/cds/appcds/test-classes/LambdaContainsOldInfApp.java
++++ /dev/null
+@@ -1,34 +0,0 @@
+-/*
+- * Copyright (c) 2021, Oracle and/or its affiliates. All rights reserved.
+- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+- *
+- * This code is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 only, as
+- * published by the Free Software Foundation.
+- *
+- * This code is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- * version 2 for more details (a copy is included in the LICENSE file that
+- * accompanied this code).
+- *
+- * You should have received a copy of the GNU General Public License version
+- * 2 along with this work; if not, write to the Free Software Foundation,
+- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+- *
+- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+- * or visit www.oracle.com if you need additional information or have any
+- * questions.
+- *
+- */
+-public class LambdaContainsOldInfApp {
+-    public static void main(final String... args) {
+-        getProvider();
+-    }
+-
+-    public static OldProvider getProvider() {
+-        return () -> {
+-            return null;
+-        };
+-    }
+-}
+diff --git a/test/hotspot/jtreg/runtime/cds/appcds/test-classes/OldProvider.jasm b/test/hotspot/jtreg/runtime/cds/appcds/test-classes/OldProvider.jasm
+deleted file mode 100644
+index 3d03a2cbc2e..00000000000
+--- a/test/hotspot/jtreg/runtime/cds/appcds/test-classes/OldProvider.jasm
++++ /dev/null
+@@ -1,29 +0,0 @@
+-/*
+- * Copyright (c) 2021, Oracle and/or its affiliates. All rights reserved.
+- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+- *
+- * This code is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 only, as
+- * published by the Free Software Foundation.
+- *
+- * This code is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- * version 2 for more details (a copy is included in the LICENSE file that
+- * accompanied this code).
+- *
+- * You should have received a copy of the GNU General Public License version
+- * 2 along with this work; if not, write to the Free Software Foundation,
+- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+- *
+- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+- * or visit www.oracle.com if you need additional information or have any
+- * questions.
+- *
+- */
+-public interface  OldProvider
+-	version 49:0
+-{
+-  public abstract Method get:"()Ljava/lang/Object;";
+-
+-} // end Class OldProvider
